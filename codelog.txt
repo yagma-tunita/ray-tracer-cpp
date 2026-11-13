@@ -1,0 +1,274 @@
+================================================================
+Ray Tracer - Code Log 
+================================================================
+
+Start date: 2026-11-08
+Project    : A CPU ray tracer written in C++ (from scratch)
+Constraint : No external C++ libraries; standard library only.
+Output     : PPM (P6) image files.
+Idea       : For every pixel, shoot a ray from the camera -> find the closest
+             intersection with the scene -> compute a shaded color -> write it
+             into the image (PPM).
+
+[File list & roles]
+- vec3.hpp    : 3D vector type + math helpers (used for vectors, points, colors)
+- ray.hpp     : a ray (origin + direction)
+- camera.hpp  : Camera class declaration (pixel coordinates -> ray)
+- camera.cpp  : Camera implementation (build orthonormal basis + viewport; GetRay)
+- hittable.hpp: abstract "thing a ray can hit" interface + HitRecord
+- sphere.hpp  : Sphere class declaration (inherits Hittable)
+- sphere.cpp  : Sphere ray intersection (quadratic) + fill HitRecord
+- image.hpp   : Image class declaration (pixel buffer -> PPM file)
+- image.cpp   : Image implementation (SetPixel, SavePPM)
+- light.hpp   : point light + Shade declaration
+- light.cpp   : Shade implementation (Lambert diffuse + ambient)
+- main.cpp    : assembly + render loop + output
+- convert.py  : tiny PPM -> PNG converter (Python + Pillow), for viewing only
+- Makefile    : build script for Windows (GNU make + MinGW g++)
+
+
+----------------------------------------------------------------
+[vec3.hpp] Role: vector math, the base type of the whole project
+----------------------------------------------------------------
+Purpose: defines Vec3 and a set of inline free functions. The same Vec3 is used
+         for vectors, points in space, and colors (colors in 0..1).
+
+Data:
+- x, y, z : double (signed; may be negative).
+
+Functions:
+- Vec3()                 : default, (0,0,0).
+- Vec3(a,b,c)            : from three numbers.
+- Add(a,b)               : vector addition a+b.
+- Sub(a,b)               : a-b (point - point = direction vector).
+- Scale(a,t)             : multiply by scalar t.
+- Neg(a)                 : -a.
+- Mult(a,b)              : component-wise product (used for color * attenuation).
+- Div(a,t)               : divide by scalar t.
+- Dot(a,b)               : dot product -> scalar.
+- Cross(a,b)             : cross product -> perpendicular vector.
+- LengthSquare(a)        : squared length.
+- Length(a)              : length = sqrt(LengthSquare).
+- Normalize(a)           : unit vector; returns (0,0,0) if length == 0.
+
+Notes:
+- Do NOT clamp colors inside Vec3; clamp only when writing the image.
+- All functions are inline in the header (avoids multiple-definition issues).
+
+
+----------------------------------------------------------------
+[ray.hpp] Role: a ray (the "probe" of ray tracing)
+----------------------------------------------------------------
+Purpose: ray = origin + direction, the half-line P(t) = origin + t*direction, t >= 0.
+
+Data:
+- origin    : Vec3 (a point).
+- direction : Vec3 (a vector; recommended unit length).
+
+Functions:
+- Ray(O,D) : constructor.
+- At(t)    : returns origin + t*direction.
+
+Conventions:
+- Normalize the direction so that t equals distance.
+- t >= 0 is in front of the origin; t < 0 is behind.
+
+
+----------------------------------------------------------------
+[camera.hpp] Role: Camera declaration (pixel -> ray)
+----------------------------------------------------------------
+Purpose: maps normalized pixel coordinates (u,v in 0..1) to a ray.
+
+Data:
+- m_origin     : Vec3, camera position (ray origin).
+- m_leftZero   : Vec3, bottom-left corner of the viewport (origin of the screen frame).
+- m_horizontal : Vec3, horizontal edge vector (length = viewport width, direction = camera right).
+- m_vertical   : Vec3, vertical edge vector (length = viewport height, direction = camera up).
+
+Functions:
+- Camera(eye, lookat, up, vfov, aspect) : build frame + viewport.
+- Ray GetRay(u, v) const                : ray for pixel (u,v).
+
+Constructor parameters:
+- eye    : camera (eye) position (a point).
+- lookat : the point the camera looks at (determines direction).
+- up     : world "up" direction (prevents the image from rolling).
+- vfov   : vertical field of view in degrees (larger = wider; smaller = zoom in).
+- aspect : width/height ratio = image width / image height.
+
+GetRay parameters:
+- u : horizontal normalized coordinate, 0 = left edge, 1 = right edge.
+- v : vertical normalized coordinate, 0 = bottom edge, 1 = top edge.
+
+
+----------------------------------------------------------------
+[camera.cpp] Role: Camera implementation
+----------------------------------------------------------------
+Constant:
+- PI = 3.1415926535 : degrees -> radians (std::tan needs radians).
+
+Constructor logic:
+- back     = Normalize(eye - lookat)      : camera "back" direction.
+- right    = Normalize(Cross(up, back))   : camera "right" direction.
+- cameraUp = Cross(back, right)           : camera "up" direction (already unit).
+- theta    = vfov * PI / 180              : degrees -> radians.
+- height   = 2 * tan(theta / 2)           : viewport height (at distance 1).
+- width    = aspect * height              : viewport width.
+- m_horizontal = width * right            : horizontal edge vector.
+- m_vertical   = height * cameraUp        : vertical edge vector.
+- m_leftZero   = (eye - back) - m_horizontal/2 - m_vertical/2 : bottom-left corner.
+
+GetRay logic:
+- point = m_leftZero + u*m_horizontal + v*m_vertical : a point on the viewport.
+- dir   = point - m_origin                           : eye -> point (into the scene).
+- return Ray(m_origin, Normalize(dir))               : origin is the EYE, not point.
+
+Notes:
+- Ray tracing is "backward": rays start at the eye, pass through the pixel, into the scene.
+
+
+----------------------------------------------------------------
+[hittable.hpp] Role: the unified "ray-hit" interface
+----------------------------------------------------------------
+Purpose: lets many shapes (sphere/plane/triangle...) be tested by the same ray;
+         the renderer depends only on the Hittable interface.
+
+HitRecord (result data, filled by the hit object):
+- m_point     : Vec3, intersection point.
+- m_normal    : Vec3, unit normal at the point, oriented toward the camera side.
+- m_t         : double, ray parameter (distance if direction is unit), default 0.
+- m_frontFace : bool, whether the ray hit the "front" side (default false).
+                dot(ray.direction, outward normal) < 0 -> front (true), keep normal;
+                otherwise -> back (false), flip normal. Used to unify normal
+                orientation and for materials (glass entering/exiting).
+
+class Hittable (abstract contract):
+- virtual ~Hittable() = default;  : virtual destructor (safe delete via base pointer).
+- virtual bool Hit(ray, tmin, tmax, rec) const = 0;  : pure virtual.
+    * returns bool: whether it is hit within [tmin, tmax] (the point goes into rec).
+    * ray  : the whole ray (the hit t is the unknown to solve).
+    * tmin : lower bound, avoids self-intersection (e.g. 0.001).
+    * tmax : upper bound, used to find the closest hit (narrowed while iterating).
+    * rec  : output parameter (point/normal/t/frontFace).
+    * const: intersection does not modify the object.
+    * pure virtual: Hittable is abstract; derived classes must implement Hit.
+
+Why virtual: polymorphism. The renderer holds Hittable* to different shapes and
+calls Hit; adding new shapes does not require changing the renderer.
+
+
+----------------------------------------------------------------
+[sphere.hpp / sphere.cpp] Role: the concrete "sphere" and its intersection
+----------------------------------------------------------------
+class Sphere : public Hittable
+- members: m_center (Vec3), m_radius (double).
+- Hit: substitute the ray P(t)=O+tD into |P-C|=R to get a quadratic:
+  * oc = O - C
+  * a = D.D, b = 2*(oc.D), c = oc.oc - R*R
+  * disc = b*b - 4*a*c
+  * if disc < 0 -> miss; else sq = sqrt(disc):
+    near root t = (-b - sq)/(2a); if not in [tmin,tmax], try far root t = (-b + sq)/(2a);
+    if neither is in range -> miss.
+- On hit: m_t = t; m_point = ray.At(t); outward = Normalize(m_point - m_center);
+  dot(ray.direction, outward) < 0 -> front (m_frontFace=true, m_normal=outward);
+  else -> back (m_frontFace=false, m_normal=-outward).
+- Bugs fixed: (1) forgot ": public Hittable" (override error); (2) range test must
+  use "||" not "&&"; (3) far root is (-b+sq)/(2a); (4) frontFace uses ray.direction;
+  (5) else branch sets frontFace=false.
+
+
+----------------------------------------------------------------
+[image.hpp / image.cpp] Role: write pixel colors into a PPM (P6) image
+----------------------------------------------------------------
+class Image
+- members: m_width, m_height (int), m_pixels (std::vector<Vec3>, size w*h).
+- constructor: Image(int w, int h) -- parameters are (WIDTH, HEIGHT); buffer = black.
+- SetPixel(x, y, c): index = y*m_width + x (row-major).
+- SavePPM(filename): open in binary; write "P6\n" + width + " " + height + "\n255\n";
+  per pixel: Clamp01 -> *255 -> write R,G,B bytes.
+- Bugs fixed: width/height were passed in reverse (PPM header came out 600x800);
+  PPM must be written in binary mode.
+
+
+----------------------------------------------------------------
+[light.hpp / light.cpp] Role: point light + shading (Lambert + ambient)
+----------------------------------------------------------------
+class Light
+- members: m_position (Vec3), m_intensity (double), m_color (Vec3).
+- accessors: Position() / Intensity() / Color().
+
+function Shade(rec, lights, baseColor, ambient) -> Vec3
+- color = baseColor * ambient.
+- for each light:
+  * Lvec = light.Position() - rec.m_point; skip if length == 0;
+  * L = Normalize(Lvec);
+  * c = max(0, dot(rec.m_normal, L));
+  * albedo = Mult(baseColor, light.Color());   // object color * light color
+  * term = albedo * (c * light.Intensity());
+  * color += term.
+- Bugs fixed: light.Color() was multiplied twice and Intensity was missing;
+  iterate with const Light& to avoid copies.
+- TODO: shadow rays (from the hit point toward the light; occluded -> c = 0).
+
+
+----------------------------------------------------------------
+[main.cpp] Role: assemble + render loop + output
+----------------------------------------------------------------
+- parameters: W=800, H=600, aspect = W/H.
+- objects: Image image(W,H); Camera(eye,lookat,up,vfov,aspect); Sphere(center,radius);
+  std::vector<Light> lights (push_back a light).
+- loop (y rows, x columns):
+  * u = x/(W-1), v = 1 - y/(H-1) (flip to avoid upside-down image);
+  * ray = camera.GetRay(u,v);
+  * if sphere.Hit(ray,0.001,1e9,rec): color = Shade(rec, lights, baseColor, ambient);
+    else: background gradient (based on ray direction y);
+  * image.SetPixel(x,y,color).
+- image.SavePPM("out.ppm").
+- baseColor is Shade's 3rd argument (change it to change the sphere color);
+  light color is Light's 3rd argument.
+
+
+----------------------------------------------------------------
+[Progress / TODO]
+----------------------------------------------------------------
+Done: vec3, ray, camera, hittable, sphere, image, light, main -- the program
+      builds into an EXE and writes out.ppm (800x600).
+Viewing: convert out.ppm to out.png with Pillow (see convert.py).
+TODO / next:
+- Shadow rays (make Shade aware of occlusion).
+- Materials (diffuse / metal / glass with reflection and refraction).
+- Multiple objects (HittableList / Scene that returns the closest hit).
+- Gamma correction; configurable parameters (resolution, samples, FOV).
+
+
+----------------------------------------------------------------
+Daily log 2026-11-08
+----------------------------------------------------------------
+- Finished hittable.hpp: HitRecord (m_point/m_normal/m_t/m_frontFace) + Hittable
+  (virtual destructor + pure virtual Hit).
+- Fixed typo m_nomal -> m_normal; added default values m_t=0.0, m_frontFace=false.
+- Concepts reviewed: intersection = solving for t; the normal is the normal of the
+  tangent plane (perpendicular to the surface, not to the ray); frontFace is used to
+  unify normal orientation and for materials; why virtual/pure-virtual/virtual-dtor.
+- Next: write sphere.hpp (Sphere : public Hittable, quadratic intersection).
+
+
+----------------------------------------------------------------
+Daily log 2026-11-13
+----------------------------------------------------------------
+Done:
+- Finished sphere.hpp/.cpp (quadratic intersection). Fixed: missing ": public Hittable",
+  range test with ||, far root (-b+sq)/(2a), frontFace via ray.direction, else frontFace=false.
+- Finished image.hpp/.cpp: Image(int w,int h), SetPixel (y*m_width+x), SavePPM (P6 binary).
+- Finished main.cpp: camera + sphere + render loop + output; fixed the reversed
+  width/height (Image(W,H); PPM header back to 800x600).
+- Added light.hpp/.cpp: point Light (position/intensity/color) + Shade
+  (Lambert diffuse + ambient). Fixed Shade term (no double color, include Intensity).
+- First image: out.ppm (800x600, 1,440,015 bytes); converted to out.png with Pillow;
+  changed the sphere color from red (0.8,0.2,0.2) to a softer color.
+Problems and fixes:
+- "override does not override a base member" -> forgot ": public Hittable".
+- PPM header 600x800 -> Image width/height passed in reverse; use Image(W,H).
+- Sphere too red -> change Shade's 3rd argument (baseColor).
+Current result: a sphere lit by a point light (with shading) + sky-blue gradient.
+Next: shadow rays; materials (reflection/refraction); multiple objects; gamma.
